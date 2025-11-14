@@ -217,7 +217,7 @@ def extract_verification_code(email_message):
     
     return None
 
-def get_verification_code_from_gmail(email_addr=None, app_password=None, max_emails=10):
+def get_verification_code_from_gmail(email_addr=None, app_password=None, max_emails=10, target_email=None):
     """
     Kết nối đến Gmail và lấy mã xác minh mới nhất
     
@@ -225,6 +225,7 @@ def get_verification_code_from_gmail(email_addr=None, app_password=None, max_ema
         email_addr: Email Gmail (mặc định dùng GMAIL_EMAIL)
         app_password: App password (mặc định dùng GMAIL_APP_PASSWORD)
         max_emails: Số lượng email tối đa để kiểm tra
+        target_email: Email đích để lọc (nếu None thì lấy email mới nhất)
     
     Returns:
         Mã xác minh 6 chữ số hoặc None nếu không tìm thấy
@@ -259,9 +260,10 @@ def get_verification_code_from_gmail(email_addr=None, app_password=None, max_ema
                 email_body = msg_data[0][1]
                 email_message = email.message_from_bytes(email_body)
                 
-                # Decode subject and sender
+                # Decode subject, sender, and recipient
                 subject = ""
                 sender = ""
+                recipient = ""
                 try:
                     subject_header = decode_header(email_message["Subject"])
                     if subject_header and len(subject_header) > 0:
@@ -292,6 +294,30 @@ def get_verification_code_from_gmail(email_addr=None, app_password=None, max_ema
                     except:
                         pass
                 
+                # Extract recipient email (To field)
+                try:
+                    recipient_header = decode_header(email_message["To"])
+                    if recipient_header and len(recipient_header) > 0:
+                        if recipient_header[0][1]:
+                            recipient = recipient_header[0][0].decode(recipient_header[0][1])
+                        else:
+                            recipient = recipient_header[0][0]
+                        if isinstance(recipient, bytes):
+                            recipient = recipient.decode('utf-8', errors='ignore')
+                except:
+                    try:
+                        recipient = str(email_message["To"])
+                    except:
+                        pass
+                
+                # Extract email address from recipient field (may contain name <email>)
+                recipient_email = ""
+                if recipient:
+                    # Try to extract email from format like "Name <email@domain.com>" or just "email@domain.com"
+                    email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', recipient.lower())
+                    if email_match:
+                        recipient_email = email_match.group(0)
+                
                 # Check if email is from MegaLLM
                 is_megallm = False
                 if sender:
@@ -299,18 +325,28 @@ def get_verification_code_from_gmail(email_addr=None, app_password=None, max_ema
                     if 'megallm' in sender_lower or 'megallm.io' in sender_lower:
                         is_megallm = True
                 
-                print(f"Checking email - From: {sender[:50] if sender else 'Unknown'}, Subject: {subject[:50] if subject else 'Unknown'}")
+                print(f"Checking email - From: {sender[:50] if sender else 'Unknown'}, To: {recipient_email[:50] if recipient_email else 'Unknown'}, Subject: {subject[:50] if subject else 'Unknown'}")
                 
                 # Skip if not from MegaLLM (unless we couldn't determine sender)
                 if sender and not is_megallm:
                     print(f"Skipping email - not from MegaLLM")
                     continue
                 
+                # If target_email is specified, check if this email matches
+                if target_email:
+                    target_email_lower = target_email.lower().strip()
+                    if recipient_email and recipient_email != target_email_lower:
+                        print(f"Skipping email - recipient {recipient_email} does not match target {target_email_lower}")
+                        continue
+                    elif not recipient_email:
+                        print(f"Warning: Could not extract recipient email, skipping for safety")
+                        continue
+                
                 # Extract verification code
                 code = extract_verification_code(email_message)
                 
                 if code:
-                    print(f"Found verification code: {code}")
+                    print(f"Found verification code: {code} for email: {recipient_email if recipient_email else 'Unknown'}")
                     # Mark email as read (optional)
                     try:
                         mail.store(email_id, '+FLAGS', '\\Seen')

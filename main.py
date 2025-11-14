@@ -3,6 +3,8 @@ import random
 import string
 import os
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -17,6 +19,37 @@ REGISTRATION_URL = "https://megallm.io/ref/REF-3DXXZJS8"
 # GMAIL_EMAIL and GMAIL_APP_PASSWORD are imported from gmail_reader.py
 PASSWORD = "Tuan@2003"
 REFERRAL_CODE = "REF-3DXXZJS8"
+NUM_THREADS = 5  # Số luồng chạy đồng thời (có thể chỉnh sửa) - Khuyến nghị bằng số proxy
+
+# Proxy configuration
+# Format hỗ trợ:
+#   - HTTP: "http://host:port" (không có auth)
+#   - HTTP với auth: "http://username:password@host:port" 
+#   - SOCKS5: "socks5://username:password@host:port" hoặc "socks5://host:port"
+# Để trống nếu không dùng proxy: PROXY_LIST = []
+PROXY_LIST = [
+    "http://172.30.16.1:10000",  # Proxy 1
+    "http://172.30.16.1:10001",  # Proxy 2
+    "http://172.30.16.1:10002",  # Proxy 3
+    "http://172.30.16.1:10003",  # Proxy 4
+    "http://172.30.16.1:10004",  # Proxy 5
+]
+USE_PROXY = len(PROXY_LIST) > 0  # Tự động bật nếu có proxy trong list
+
+# Thread-safe proxy manager
+proxy_lock = threading.Lock()
+proxy_index = 0
+
+def get_proxy_for_thread():
+    """Lấy proxy cho thread (round-robin)"""
+    if not USE_PROXY or not PROXY_LIST:
+        return None
+    
+    with proxy_lock:
+        global proxy_index
+        proxy = PROXY_LIST[proxy_index % len(PROXY_LIST)]
+        proxy_index += 1
+        return proxy
 
 def generate_random_name(length=8):
     """Generate a random name with letters"""
@@ -213,8 +246,13 @@ def setup_fake_chrome_fingerprint(driver):
         print(f"Warning: Could not setup fake fingerprint: {e}")
         # Continue anyway
 
-def setup_driver():
-    """Setup Chrome driver with options and fake fingerprint"""
+def setup_driver(proxy=None):
+    """
+    Setup Chrome driver with options and fake fingerprint
+    
+    Args:
+        proxy: Proxy string in format "http://user:pass@host:port", "socks5://user:pass@host:port", or "http://host:port"
+    """
     chrome_options = Options()
     # chrome_options.add_argument("--headless")  # Uncomment if you want headless mode
     chrome_options.add_argument("--no-sandbox")
@@ -222,6 +260,25 @@ def setup_driver():
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_argument("--disable-automation")
     chrome_options.add_argument("--disable-infobars")
+    
+    # Add proxy if provided
+    if proxy:
+        # SOCKS5 format: socks5://username:password@host:port
+        # HTTP format: http://username:password@host:port
+        chrome_options.add_argument(f"--proxy-server={proxy}")
+        
+        # Thêm các options để hỗ trợ proxy tốt hơn
+        chrome_options.add_argument("--disable-web-security")
+        chrome_options.add_argument("--allow-running-insecure-content")
+        
+        # Options đặc biệt cho SOCKS5
+        if proxy.startswith("socks5://"):
+            # SOCKS5 có thể cần thêm options này
+            chrome_options.add_argument("--disable-features=VizDisplayCompositor")
+        
+        proxy_display = proxy.split('@')[-1] if '@' in proxy else proxy
+        proxy_type = "SOCKS5" if proxy.startswith("socks5://") else "HTTP"
+        print(f"Using {proxy_type} proxy: {proxy_display}")  # Hide credentials in log
     
     # Random user agent
     user_agent = get_random_user_agent()
@@ -561,7 +618,7 @@ def fill_registration_form(driver, name, email, password, confirm_password, refe
     
     # Click Sign Up button with retry mechanism (max 5 attempts)
     print("Clicking Sign Up button...")
-    max_click_attempts = 5
+    max_click_attempts = 10
     url_changed = False
     
     for attempt in range(1, max_click_attempts + 1):
@@ -735,15 +792,15 @@ def create_account(driver):
     print("Waiting for verification email (15 seconds)...")
     time.sleep(15)
     
-    # Get verification code from Gmail
+    # Get verification code from Gmail (filter by target email)
     verification_code = None
     max_retries = 10
     for attempt in range(max_retries):
-        verification_code = get_verification_code_from_gmail()
+        verification_code = get_verification_code_from_gmail(target_email=email_addr)
         if verification_code:
-            print(f"Verification code found: {verification_code}")
+            print(f"Verification code found: {verification_code} for {email_addr}")
             break
-        print(f"Attempt {attempt + 1}/{max_retries}: Code not found, retrying...")
+        print(f"Attempt {attempt + 1}/{max_retries}: Code not found for {email_addr}, retrying...")
         time.sleep(3)
     
     if not verification_code:
@@ -754,111 +811,165 @@ def create_account(driver):
     print(f"Account created successfully: {email_addr}")
     time.sleep(2)
 
+def create_account_worker(account_id, stats_lock, stats):
+    """Worker function for creating a single account in a thread"""
+    driver = None
+    proxy = None
+    try:
+        # Get proxy for this thread
+        if USE_PROXY:
+            proxy = get_proxy_for_thread()
+        
+        # Setup driver for this account
+        print(f"\n[Thread {threading.current_thread().name}] {'='*60}")
+        print(f"[Thread {threading.current_thread().name}] Setting up browser for account #{account_id}")
+        if proxy:
+            print(f"[Thread {threading.current_thread().name}] Using proxy: {proxy.split('@')[-1] if '@' in proxy else proxy}")
+        print(f"[Thread {threading.current_thread().name}] {'='*60}")
+        driver = setup_driver(proxy=proxy)
+        
+        with stats_lock:
+            stats['account_count'] += 1
+            current_stats = stats.copy()
+        
+        print(f"\n[Thread {threading.current_thread().name}] {'='*60}")
+        print(f"[Thread {threading.current_thread().name}] Creating account #{account_id}")
+        print(f"[Thread {threading.current_thread().name}] Stats: Success: {current_stats['success_count']}, Errors: {current_stats['error_count']}")
+        print(f"[Thread {threading.current_thread().name}] {'='*60}")
+        
+        try:
+            # Create account
+            create_account(driver)
+            
+            with stats_lock:
+                stats['success_count'] += 1
+                current_stats = stats.copy()
+            
+            print(f"\n[Thread {threading.current_thread().name}] {'='*60}")
+            print(f"[Thread {threading.current_thread().name}] Account #{account_id} created successfully!")
+            print(f"[Thread {threading.current_thread().name}] Stats: Success: {current_stats['success_count']}, Errors: {current_stats['error_count']}")
+            print(f"[Thread {threading.current_thread().name}] {'='*60}")
+        except Exception as e:
+            with stats_lock:
+                stats['error_count'] += 1
+                current_stats = stats.copy()
+            
+            print(f"\n[Thread {threading.current_thread().name}] {'='*60}")
+            print(f"[Thread {threading.current_thread().name}] Error creating account #{account_id}: {e}")
+            print(f"[Thread {threading.current_thread().name}] Stats: Success: {current_stats['success_count']}, Errors: {current_stats['error_count']}")
+            print(f"[Thread {threading.current_thread().name}] {'='*60}")
+            import traceback
+            print(f"\n[Thread {threading.current_thread().name}] Traceback:")
+            traceback.print_exc()
+        finally:
+            # Close browser after each account (success or failure)
+            if driver:
+                try:
+                    print(f"[Thread {threading.current_thread().name}] Closing browser...")
+                    driver.quit()
+                    print(f"[Thread {threading.current_thread().name}] Browser closed")
+                except Exception as e:
+                    print(f"[Thread {threading.current_thread().name}] Error closing browser: {e}")
+                    # Try to kill browser process if quit fails
+                    try:
+                        if os.name == 'nt':  # Windows
+                            os.system("taskkill /F /IM chrome.exe /T")
+                        else:  # Linux/Mac
+                            os.system("pkill -f chrome")
+                    except:
+                        pass
+    except Exception as e:
+        # Fatal error (e.g., setup_driver failed)
+        print(f"\n[Thread {threading.current_thread().name}] {'='*60}")
+        print(f"[Thread {threading.current_thread().name}] Fatal error: {e}")
+        print(f"[Thread {threading.current_thread().name}] {'='*60}")
+        import traceback
+        print(f"\n[Thread {threading.current_thread().name}] Traceback:")
+        traceback.print_exc()
+        
+        # Close browser if still open
+        if driver:
+            try:
+                driver.quit()
+            except:
+                pass
+
 def main():
-    """Main function to create accounts continuously"""
-    account_count = 0
-    success_count = 0
-    error_count = 0
+    """Main function to create accounts continuously with multi-threading"""
+    # Thread-safe statistics
+    stats_lock = threading.Lock()
+    stats = {
+        'account_count': 0,
+        'success_count': 0,
+        'error_count': 0
+    }
     
     print(f"\n{'='*60}")
-    print("Starting account creation bot (infinite loop)")
+    print("Starting account creation bot (multi-threaded)")
+    print(f"Number of threads: {NUM_THREADS}")
+    if USE_PROXY:
+        print(f"Proxy mode: ENABLED ({len(PROXY_LIST)} proxy/proxies configured)")
+        if len(PROXY_LIST) > 0:
+            print("Proxy list:")
+            for i, proxy in enumerate(PROXY_LIST[:5], 1):  # Show first 5
+                proxy_display = proxy.split('@')[-1] if '@' in proxy else proxy
+                print(f"  {i}. {proxy_display}")
+            if len(PROXY_LIST) > 5:
+                print(f"  ... and {len(PROXY_LIST) - 5} more")
+    else:
+        print("Proxy mode: DISABLED")
     print("Press Ctrl+C to stop")
     print(f"{'='*60}\n")
     
-    while True:
-        driver = None
-        try:
-            # Setup driver for each account
-            print(f"\n{'='*60}")
-            print(f"Setting up browser for account #{account_count + 1}")
-            print(f"{'='*60}")
-            driver = setup_driver()
-            account_count += 1
+    account_id = 0
+    
+    try:
+        with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
+            futures = set()
             
-            print(f"\n{'='*60}")
-            print(f"Creating account #{account_count}")
-            print(f"Stats: Success: {success_count}, Errors: {error_count}")
-            print(f"{'='*60}")
-            
-            try:
-                # Create account
-                create_account(driver)
-                success_count += 1
-                print(f"\n{'='*60}")
-                print(f"Account #{account_count} created successfully!")
-                print(f"Stats: Success: {success_count}, Errors: {error_count}")
-                print(f"{'='*60}")
-            except Exception as e:
-                error_count += 1
-                print(f"\n{'='*60}")
-                print(f"Error creating account #{account_count}: {e}")
-                print(f"Stats: Success: {success_count}, Errors: {error_count}")
-                print(f"{'='*60}")
-                import traceback
-                print("\nTraceback:")
-                traceback.print_exc()
-            finally:
-                # Close browser after each account (success or failure)
-                if driver:
-                    try:
-                        print("Closing browser...")
-                        driver.quit()
-                        print("Browser closed")
-                    except Exception as e:
-                        print(f"Error closing browser: {e}")
-                        # Try to kill browser process if quit fails
+            while True:
+                # Submit new tasks up to NUM_THREADS
+                while len(futures) < NUM_THREADS:
+                    account_id += 1
+                    future = executor.submit(create_account_worker, account_id, stats_lock, stats)
+                    futures.add(future)
+                    time.sleep(1)  # Small delay between starting threads
+                
+                # Wait for at least one task to complete
+                done_futures = []
+                try:
+                    for future in as_completed(futures, timeout=1):
                         try:
-                            import os
-                            if os.name == 'nt':  # Windows
-                                os.system("taskkill /F /IM chrome.exe /T")
-                            else:  # Linux/Mac
-                                os.system("pkill -f chrome")
-                        except:
-                            pass
-            
-            # Wait before creating next account
-            print(f"\nWaiting 3 seconds before next account...")
-            time.sleep(3)
-            
-        except KeyboardInterrupt:
-            print(f"\n\n{'='*60}")
-            print("Stopped by user (Ctrl+C)")
-            print(f"{'='*60}")
-            print(f"\nFinal Stats:")
-            print(f"  Total accounts attempted: {account_count}")
-            print(f"  Success: {success_count}")
-            print(f"  Errors: {error_count}")
-            print(f"{'='*60}\n")
-            
-            # Close browser if still open
-            if driver:
-                try:
-                    driver.quit()
-                    print("Browser closed")
-                except:
+                            future.result()  # Get result (or exception)
+                        except Exception as e:
+                            pass  # Already handled in worker
+                        done_futures.append(future)
+                except Exception:
+                    # Timeout or other error - no futures completed yet, continue
                     pass
-            break
-            
-        except Exception as e:
-            # Fatal error (e.g., setup_driver failed)
-            print(f"\n{'='*60}")
-            print(f"Fatal error: {e}")
-            print(f"{'='*60}")
-            import traceback
-            print("\nTraceback:")
-            traceback.print_exc()
-            
-            # Close browser if still open
-            if driver:
-                try:
-                    driver.quit()
-                except:
-                    pass
-            
-            # Wait longer before retrying (driver setup failed)
-            print(f"\nWaiting 10 seconds before retrying...")
-            time.sleep(10)
-            continue
+                
+                # Remove completed futures
+                for future in done_futures:
+                    futures.discard(future)
+                
+                # Print periodic stats
+                with stats_lock:
+                    current_stats = stats.copy()
+                print(f"\n[Main] Current Stats - Total: {current_stats['account_count']}, Success: {current_stats['success_count']}, Errors: {current_stats['error_count']}")
+                
+    except KeyboardInterrupt:
+        print(f"\n\n{'='*60}")
+        print("Stopped by user (Ctrl+C)")
+        print(f"{'='*60}")
+        
+        with stats_lock:
+            final_stats = stats.copy()
+        
+        print(f"\nFinal Stats:")
+        print(f"  Total accounts attempted: {final_stats['account_count']}")
+        print(f"  Success: {final_stats['success_count']}")
+        print(f"  Errors: {final_stats['error_count']}")
+        print(f"{'='*60}\n")
 
 if __name__ == "__main__":
     main()
