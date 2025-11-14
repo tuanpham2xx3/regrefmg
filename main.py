@@ -18,7 +18,7 @@ from gmail_reader import get_verification_code_from_gmail, GMAIL_EMAIL, GMAIL_AP
 REGISTRATION_URL = "https://megallm.io/ref/REF-3DXXZJS8"
 # GMAIL_EMAIL and GMAIL_APP_PASSWORD are imported from gmail_reader.py
 PASSWORD = "Tuan@2003"
-REFERRAL_CODE = "REF-3DXXZJS8"
+REFERRAL_CODE = "REF-JXKY9D8W"
 NUM_THREADS = 5  # Số luồng chạy đồng thời (có thể chỉnh sửa) - Khuyến nghị bằng số proxy
 
 # Proxy configuration
@@ -36,19 +36,35 @@ PROXY_LIST = [
 ]
 USE_PROXY = len(PROXY_LIST) > 0  # Tự động bật nếu có proxy trong list
 
-# Thread-safe proxy manager
-proxy_lock = threading.Lock()
-proxy_index = 0
+# Thread-safe proxy manager - mỗi thread có proxy riêng cố định
+thread_proxy_map = {}  # Map thread name -> proxy
+proxy_map_lock = threading.Lock()
 
-def get_proxy_for_thread():
-    """Lấy proxy cho thread (round-robin)"""
+def get_proxy_for_thread(thread_name=None):
+    """
+    Lấy proxy cố định cho thread - mỗi thread chỉ dùng 1 proxy
+    Args:
+        thread_name: Tên thread (nếu None thì dùng current thread name)
+    Returns:
+        Proxy string hoặc None
+    """
     if not USE_PROXY or not PROXY_LIST:
         return None
     
-    with proxy_lock:
-        global proxy_index
-        proxy = PROXY_LIST[proxy_index % len(PROXY_LIST)]
-        proxy_index += 1
+    if thread_name is None:
+        thread_name = threading.current_thread().name
+    
+    # Kiểm tra xem thread đã có proxy chưa
+    with proxy_map_lock:
+        if thread_name in thread_proxy_map:
+            # Thread đã có proxy, trả về proxy đó
+            return thread_proxy_map[thread_name]
+        
+        # Gán proxy mới cho thread dựa trên số lượng thread đã có proxy
+        proxy_index = len(thread_proxy_map) % len(PROXY_LIST)
+        proxy = PROXY_LIST[proxy_index]
+        thread_proxy_map[thread_name] = proxy
+        print(f"[Proxy Manager] Gán proxy cho thread '{thread_name}': {proxy}")
         return proxy
 
 def generate_random_name(length=8):
@@ -815,27 +831,36 @@ def create_account_worker(account_id, stats_lock, stats):
     """Worker function for creating a single account in a thread"""
     driver = None
     proxy = None
+    thread_name = threading.current_thread().name
+    
     try:
-        # Get proxy for this thread
+        # Get proxy cố định cho thread này (mỗi thread chỉ có 1 proxy)
         if USE_PROXY:
-            proxy = get_proxy_for_thread()
+            proxy = get_proxy_for_thread(thread_name)
         
         # Setup driver for this account
-        print(f"\n[Thread {threading.current_thread().name}] {'='*60}")
-        print(f"[Thread {threading.current_thread().name}] Setting up browser for account #{account_id}")
+        print(f"\n{'='*70}")
+        print(f"[Thread: {thread_name}] {'='*70}")
+        print(f"[Thread: {thread_name}] Account ID: #{account_id}")
         if proxy:
-            print(f"[Thread {threading.current_thread().name}] Using proxy: {proxy.split('@')[-1] if '@' in proxy else proxy}")
-        print(f"[Thread {threading.current_thread().name}] {'='*60}")
+            proxy_display = proxy.split('@')[-1] if '@' in proxy else proxy
+            print(f"[Thread: {thread_name}] 🌐 PROXY: {proxy_display}")
+        else:
+            print(f"[Thread: {thread_name}] 🌐 PROXY: None (không dùng proxy)")
+        print(f"[Thread: {thread_name}] {'='*70}")
         driver = setup_driver(proxy=proxy)
         
         with stats_lock:
             stats['account_count'] += 1
             current_stats = stats.copy()
         
-        print(f"\n[Thread {threading.current_thread().name}] {'='*60}")
-        print(f"[Thread {threading.current_thread().name}] Creating account #{account_id}")
-        print(f"[Thread {threading.current_thread().name}] Stats: Success: {current_stats['success_count']}, Errors: {current_stats['error_count']}")
-        print(f"[Thread {threading.current_thread().name}] {'='*60}")
+        print(f"\n[Thread: {thread_name}] {'='*70}")
+        print(f"[Thread: {thread_name}] 📝 Bắt đầu tạo account #{account_id}")
+        if proxy:
+            proxy_display = proxy.split('@')[-1] if '@' in proxy else proxy
+            print(f"[Thread: {thread_name}] 🌐 Đang dùng PROXY: {proxy_display}")
+        print(f"[Thread: {thread_name}] 📊 Stats: Success={current_stats['success_count']}, Errors={current_stats['error_count']}")
+        print(f"[Thread: {thread_name}] {'='*70}")
         
         try:
             # Create account
@@ -845,31 +870,37 @@ def create_account_worker(account_id, stats_lock, stats):
                 stats['success_count'] += 1
                 current_stats = stats.copy()
             
-            print(f"\n[Thread {threading.current_thread().name}] {'='*60}")
-            print(f"[Thread {threading.current_thread().name}] Account #{account_id} created successfully!")
-            print(f"[Thread {threading.current_thread().name}] Stats: Success: {current_stats['success_count']}, Errors: {current_stats['error_count']}")
-            print(f"[Thread {threading.current_thread().name}] {'='*60}")
+            print(f"\n[Thread: {thread_name}] {'='*70}")
+            print(f"[Thread: {thread_name}] ✅ Account #{account_id} tạo thành công!")
+            if proxy:
+                proxy_display = proxy.split('@')[-1] if '@' in proxy else proxy
+                print(f"[Thread: {thread_name}] 🌐 PROXY đã dùng: {proxy_display}")
+            print(f"[Thread: {thread_name}] 📊 Stats: Success={current_stats['success_count']}, Errors={current_stats['error_count']}")
+            print(f"[Thread: {thread_name}] {'='*70}")
         except Exception as e:
             with stats_lock:
                 stats['error_count'] += 1
                 current_stats = stats.copy()
             
-            print(f"\n[Thread {threading.current_thread().name}] {'='*60}")
-            print(f"[Thread {threading.current_thread().name}] Error creating account #{account_id}: {e}")
-            print(f"[Thread {threading.current_thread().name}] Stats: Success: {current_stats['success_count']}, Errors: {current_stats['error_count']}")
-            print(f"[Thread {threading.current_thread().name}] {'='*60}")
+            print(f"\n[Thread: {thread_name}] {'='*70}")
+            print(f"[Thread: {thread_name}] ❌ Lỗi khi tạo account #{account_id}: {e}")
+            if proxy:
+                proxy_display = proxy.split('@')[-1] if '@' in proxy else proxy
+                print(f"[Thread: {thread_name}] 🌐 PROXY đã dùng: {proxy_display}")
+            print(f"[Thread: {thread_name}] 📊 Stats: Success={current_stats['success_count']}, Errors={current_stats['error_count']}")
+            print(f"[Thread: {thread_name}] {'='*70}")
             import traceback
-            print(f"\n[Thread {threading.current_thread().name}] Traceback:")
+            print(f"\n[Thread: {thread_name}] Traceback:")
             traceback.print_exc()
         finally:
             # Close browser after each account (success or failure)
             if driver:
                 try:
-                    print(f"[Thread {threading.current_thread().name}] Closing browser...")
+                    print(f"[Thread: {thread_name}] 🔒 Đóng browser...")
                     driver.quit()
-                    print(f"[Thread {threading.current_thread().name}] Browser closed")
+                    print(f"[Thread: {thread_name}] ✅ Browser đã đóng")
                 except Exception as e:
-                    print(f"[Thread {threading.current_thread().name}] Error closing browser: {e}")
+                    print(f"[Thread: {thread_name}] ⚠️ Lỗi khi đóng browser: {e}")
                     # Try to kill browser process if quit fails
                     try:
                         if os.name == 'nt':  # Windows
@@ -880,11 +911,14 @@ def create_account_worker(account_id, stats_lock, stats):
                         pass
     except Exception as e:
         # Fatal error (e.g., setup_driver failed)
-        print(f"\n[Thread {threading.current_thread().name}] {'='*60}")
-        print(f"[Thread {threading.current_thread().name}] Fatal error: {e}")
-        print(f"[Thread {threading.current_thread().name}] {'='*60}")
+        print(f"\n[Thread: {thread_name}] {'='*70}")
+        print(f"[Thread: {thread_name}] ❌ Fatal error: {e}")
+        if proxy:
+            proxy_display = proxy.split('@')[-1] if '@' in proxy else proxy
+            print(f"[Thread: {thread_name}] 🌐 PROXY đã dùng: {proxy_display}")
+        print(f"[Thread: {thread_name}] {'='*70}")
         import traceback
-        print(f"\n[Thread {threading.current_thread().name}] Traceback:")
+        print(f"\n[Thread: {thread_name}] Traceback:")
         traceback.print_exc()
         
         # Close browser if still open
@@ -908,16 +942,16 @@ def main():
     print("Starting account creation bot (multi-threaded)")
     print(f"Number of threads: {NUM_THREADS}")
     if USE_PROXY:
-        print(f"Proxy mode: ENABLED ({len(PROXY_LIST)} proxy/proxies configured)")
+        print(f"🌐 Proxy mode: ENABLED ({len(PROXY_LIST)} proxy/proxies configured)")
+        print(f"📊 Số luồng: {NUM_THREADS}")
         if len(PROXY_LIST) > 0:
-            print("Proxy list:")
-            for i, proxy in enumerate(PROXY_LIST[:5], 1):  # Show first 5
+            print("\n📋 Danh sách Proxy:")
+            for i, proxy in enumerate(PROXY_LIST, 1):
                 proxy_display = proxy.split('@')[-1] if '@' in proxy else proxy
-                print(f"  {i}. {proxy_display}")
-            if len(PROXY_LIST) > 5:
-                print(f"  ... and {len(PROXY_LIST) - 5} more")
+                print(f"  [{i}] {proxy_display}")
+            print(f"\n💡 Mỗi luồng sẽ được gán 1 proxy cố định (không chia sẻ)")
     else:
-        print("Proxy mode: DISABLED")
+        print("🌐 Proxy mode: DISABLED")
     print("Press Ctrl+C to stop")
     print(f"{'='*60}\n")
     
