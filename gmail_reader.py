@@ -10,6 +10,7 @@ import imaplib
 import email
 import sys
 from email.header import decode_header
+from email.utils import parsedate_to_datetime
 
 # Fix encoding for Windows console
 if sys.platform == 'win32':
@@ -217,15 +218,18 @@ def extract_verification_code(email_message):
     
     return None
 
-def get_verification_code_from_gmail(email_addr=None, app_password=None, max_emails=10, target_email=None):
+def get_verification_code_from_gmail(email_addr=None, app_password=None, max_emails=50, target_email=None, after_time=None, used_email_ids=None, used_email_lock=None):
     """
     Kết nối đến Gmail và lấy mã xác minh mới nhất
     
     Args:
         email_addr: Email Gmail (mặc định dùng GMAIL_EMAIL)
         app_password: App password (mặc định dùng GMAIL_APP_PASSWORD)
-        max_emails: Số lượng email tối đa để kiểm tra
+        max_emails: Số lượng email tối đa để kiểm tra (mặc định 50)
         target_email: Email đích để lọc (nếu None thì lấy email mới nhất)
+        after_time: datetime object - chỉ tìm email sau thời điểm này (None = không filter)
+        used_email_ids: set - Set các email ID đã được sử dụng (thread-safe)
+        used_email_lock: threading.Lock - Lock cho used_email_ids
     
     Returns:
         Mã xác minh 6 chữ số hoặc None nếu không tìm thấy
@@ -251,6 +255,14 @@ def get_verification_code_from_gmail(email_addr=None, app_password=None, max_ema
         # Process emails from newest to oldest
         for email_id in email_ids_sorted:
             try:
+                # Check if email already used (thread-safe)
+                if used_email_ids is not None and used_email_lock is not None:
+                    email_id_str = email_id.decode() if isinstance(email_id, bytes) else str(email_id)
+                    with used_email_lock:
+                        if email_id_str in used_email_ids:
+                            print(f"Skipping email {email_id_str} - already used by another thread")
+                            continue
+                
                 status, msg_data = mail.fetch(email_id, "(RFC822)")
                 
                 if status != "OK":
@@ -325,6 +337,19 @@ def get_verification_code_from_gmail(email_addr=None, app_password=None, max_ema
                     if 'megallm' in sender_lower or 'megallm.io' in sender_lower:
                         is_megallm = True
                 
+                # Filter by time if provided (only get emails after submit_time)
+                if after_time:
+                    try:
+                        email_date_str = email_message["Date"]
+                        if email_date_str:
+                            email_date = parsedate_to_datetime(email_date_str)
+                            if email_date < after_time:
+                                print(f"Skipping email - too old (email date: {email_date}, after_time: {after_time})")
+                                continue
+                    except Exception as e:
+                        print(f"Warning: Could not parse email date: {e}, continuing anyway")
+                        # Continue anyway if can't parse date
+                
                 print(f"Checking email - From: {sender[:50] if sender else 'Unknown'}, To: {recipient_email[:50] if recipient_email else 'Unknown'}, Subject: {subject[:50] if subject else 'Unknown'}")
                 
                 # Skip if not from MegaLLM (unless we couldn't determine sender)
@@ -346,6 +371,12 @@ def get_verification_code_from_gmail(email_addr=None, app_password=None, max_ema
                 code = extract_verification_code(email_message)
                 
                 if code:
+                    # Mark email as used (thread-safe)
+                    if used_email_ids is not None and used_email_lock is not None:
+                        email_id_str = email_id.decode() if isinstance(email_id, bytes) else str(email_id)
+                        with used_email_lock:
+                            used_email_ids.add(email_id_str)
+                    
                     print(f"Found verification code: {code} for email: {recipient_email if recipient_email else 'Unknown'}")
                     # Mark email as read (optional)
                     try:

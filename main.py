@@ -4,6 +4,7 @@ import string
 import os
 import json
 import threading
+import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -39,6 +40,10 @@ USE_PROXY = len(PROXY_LIST) > 0  # Tự động bật nếu có proxy trong list
 # Thread-safe proxy manager - mỗi thread có proxy riêng cố định
 thread_proxy_map = {}  # Map thread name -> proxy
 proxy_map_lock = threading.Lock()
+
+# Thread-safe email marking - tránh nhiều thread lấy cùng email
+used_email_ids = set()  # Set các email ID đã được sử dụng
+used_email_lock = threading.Lock()
 
 def get_proxy_for_thread(thread_name=None):
     """
@@ -634,7 +639,7 @@ def fill_registration_form(driver, name, email, password, confirm_password, refe
     
     # Click Sign Up button with retry mechanism (max 5 attempts)
     print("Clicking Sign Up button...")
-    max_click_attempts = 10
+    max_click_attempts = 30
     url_changed = False
     
     for attempt in range(1, max_click_attempts + 1):
@@ -804,20 +809,30 @@ def create_account(driver):
     # Fill registration form
     fill_registration_form(driver, name, email_addr, PASSWORD, PASSWORD, REFERRAL_CODE)
     
+    # Lưu thời điểm submit form để filter email sau này
+    submit_time = datetime.datetime.now()
+    print(f"Form submitted at: {submit_time}")
+    
     # Wait for email to be sent (increased to 15 seconds)
     print("Waiting for verification email (15 seconds)...")
     time.sleep(15)
     
-    # Get verification code from Gmail (filter by target email)
+    # Get verification code from Gmail (filter by target email and time)
     verification_code = None
-    max_retries = 10
+    max_retries = 20  # Tăng từ 10 lên 20
     for attempt in range(max_retries):
-        verification_code = get_verification_code_from_gmail(target_email=email_addr)
+        verification_code = get_verification_code_from_gmail(
+            target_email=email_addr,
+            max_emails=50,  # Tăng từ 10 lên 50
+            after_time=submit_time,  # Chỉ lấy email sau khi submit form
+            used_email_ids=used_email_ids,  # Thread-safe marking
+            used_email_lock=used_email_lock
+        )
         if verification_code:
             print(f"Verification code found: {verification_code} for {email_addr}")
             break
         print(f"Attempt {attempt + 1}/{max_retries}: Code not found for {email_addr}, retrying...")
-        time.sleep(3)
+        time.sleep(5)  # Tăng delay từ 3 lên 5 giây
     
     if not verification_code:
         raise Exception("Could not retrieve verification code from email")
@@ -967,7 +982,7 @@ def main():
                     account_id += 1
                     future = executor.submit(create_account_worker, account_id, stats_lock, stats)
                     futures.add(future)
-                    time.sleep(1)  # Small delay between starting threads
+                    time.sleep(5)  # Delay 5 giây giữa các thread để tránh conflict
                 
                 # Wait for at least one task to complete
                 done_futures = []
